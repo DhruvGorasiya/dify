@@ -940,7 +940,7 @@ services:
 
   # The Weaviate vector store.
   weaviate:
-    image: semitechnologies/weaviate:1.27.0
+    image: semitechnologies/weaviate:1.33.1
     profiles:
       - weaviate
     restart: always

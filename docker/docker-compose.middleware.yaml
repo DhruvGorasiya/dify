@@ -194,6 +194,8 @@ services:
     environment:
       # The Weaviate configurations
       # You can refer to the [Weaviate](https://weaviate.io/developers/weaviate/config-refs/env-vars) documentation for more information.
+      ENABLE_MODULES: ${WEAVIATE_ENABLE_MODULES:-backup-filesystem}
+      BACKUP_FILESYSTEM_PATH: ${WEAVIATE_BACKUP_FILESYSTEM_PATH:-/var/lib/weaviate/backups}
       PERSISTENCE_DATA_PATH: ${WEAVIATE_PERSISTENCE_DATA_PATH:-/var/lib/weaviate}
       QUERY_DEFAULTS_LIMIT: ${WEAVIATE_QUERY_DEFAULTS_LIMIT:-25}
       AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: ${WEAVIATE_AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED:-false}

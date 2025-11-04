@@ -78,7 +78,7 @@ curl -s -H "Authorization: Bearer WVF5YThaHlkYwhGUSmCRgsX3tD5ngdN8pkih" \
   python3 -c "
 import json, sys
 data = json.load(sys.stdin)
-collections = [cls['class'] for cls in data.get('classes', []) if 'Vector_index' in cls['class']]
+collections = [cls['class'] for cls in data.get('classes', []) if 'vector_config' not in cls['class']]
 print('Collections to backup:')
 for col in collections:
     print(f'  - {col}')

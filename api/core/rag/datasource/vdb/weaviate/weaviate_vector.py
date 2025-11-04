@@ -41,11 +41,13 @@ class WeaviateConfig(BaseModel):
         endpoint: Weaviate server endpoint URL
         api_key: Optional API key for authentication
         batch_size: Number of objects to batch per insert operation
+        grpc_port: Optional custom gRPC port (defaults to 50051 for insecure, 443 for secure cloud endpoints)
     """
 
     endpoint: str
     api_key: str | None = None
     batch_size: int = 100
+    grpc_port: int | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -82,6 +84,7 @@ class WeaviateVector(BaseVector):
         Initializes and returns a connected Weaviate client.
 
         Configures both HTTP and gRPC connections with proper authentication.
+        gRPC port can be customized via config or defaults to 50051.
         """
         p = urlparse(config.endpoint)
         host = p.hostname or config.endpoint.replace("https://", "").replace("http://", "")
@@ -90,7 +93,9 @@ class WeaviateVector(BaseVector):
 
         grpc_host = host
         grpc_secure = http_secure
-        grpc_port = 443 if grpc_secure else 50051
+        # Use custom grpc_port if provided, otherwise default to 50051
+        # Cloud deployments may use 443 for gRPC, which should be set explicitly
+        grpc_port = config.grpc_port if config.grpc_port is not None else 50051
 
         client = weaviate.connect_to_custom(
             http_host=host,
@@ -433,6 +438,7 @@ class WeaviateVectorFactory(AbstractVectorFactory):
                 endpoint=dify_config.WEAVIATE_ENDPOINT or "",
                 api_key=dify_config.WEAVIATE_API_KEY,
                 batch_size=dify_config.WEAVIATE_BATCH_SIZE,
+                grpc_port=dify_config.WEAVIATE_GRPC_PORT,
             ),
             attributes=attributes,
         )

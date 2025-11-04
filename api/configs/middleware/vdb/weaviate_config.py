@@ -22,6 +22,14 @@ class WeaviateConfig(BaseSettings):
         default=True,
     )
 
+    WEAVIATE_GRPC_PORT: int | None = Field(
+        description=(
+            "gRPC port for Weaviate connection (defaults to 50051 if not specified, "
+            "cloud deployments may use 443)"
+        ),
+        default=None,
+    )
+
     WEAVIATE_BATCH_SIZE: PositiveInt = Field(
         description="Number of objects to be processed in a single batch operation (default is 100)",
         default=100,

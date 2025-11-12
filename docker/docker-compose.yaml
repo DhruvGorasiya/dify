@@ -630,6 +630,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
+      weaviate-migrator:
+        condition: service_completed_successfully
     volumes:
       # Mount the storage directory to the container, for storing user files.
       - ./volumes/app/storage:/app/api/storage
@@ -657,6 +659,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
+      weaviate-migrator:
+        condition: service_completed_successfully
     volumes:
       # Mount the storage directory to the container, for storing user files.
       - ./volumes/app/storage:/app/api/storage
@@ -679,6 +683,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
+      weaviate-migrator:
+        condition: service_completed_successfully
     networks:
       - ssrf_proxy_network
       - default
@@ -940,14 +946,13 @@ services:
 
   # The Weaviate vector store.
   weaviate:
-    image: semitechnologies/weaviate:1.33.1
+    image: semitechnologies/weaviate:1.27.0
     profiles:
       - weaviate
     restart: always
     volumes:
       # Mount the Weaviate data directory to the container.
       - ./volumes/weaviate:/var/lib/weaviate
-      - ./volumes/weaviate_backups:/var/lib/weaviate/backups
     environment:
       # The Weaviate configurations
       # You can refer to the [Weaviate](https://weaviate.io/developers/weaviate/config-refs/env-vars) documentation for more information.
@@ -963,9 +968,40 @@ services:
       AUTHENTICATION_APIKEY_USERS: ${WEAVIATE_AUTHENTICATION_APIKEY_USERS:-hello@dify.ai}
       AUTHORIZATION_ADMINLIST_ENABLED: ${WEAVIATE_AUTHORIZATION_ADMINLIST_ENABLED:-true}
       AUTHORIZATION_ADMINLIST_USERS: ${WEAVIATE_AUTHORIZATION_ADMINLIST_USERS:-hello@dify.ai}
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf http://localhost:8080/v1/meta >/dev/null",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
     ports:
       - "${EXPOSE_WEAVIATE_PORT:-8080}:8080"
       - "${EXPOSE_WEAVIATE_GRPC_PORT:-50051}:50051"
+
+  weaviate-migrator:
+    build:
+      context: ..
+      dockerfile: docker/weaviate-migrator.Dockerfile
+    profiles:
+      - weaviate
+    restart: "no"
+    environment:
+      WEAVIATE_SCHEME: http
+      WEAVIATE_HOST: weaviate
+      WEAVIATE_PORT: 8080
+      WEAVIATE_GRPC_PORT: 50051
+      WEAVIATE_API_KEY: ${WEAVIATE_API_KEY:-WVF5YThaHlkYwhGUSmCRgsX3tD5ngdN8pkih}
+      WEAVIATE_AUTO_MIGRATE: ${WEAVIATE_AUTO_MIGRATE:-true}
+      WEAVIATE_MIGRATION_WAIT_TIMEOUT: ${WEAVIATE_MIGRATION_WAIT_TIMEOUT:-600}
+      WEAVIATE_MIGRATION_WAIT_INTERVAL: ${WEAVIATE_MIGRATION_WAIT_INTERVAL:-5}
+      WEAVIATE_MIGRATION_IGNORE_UNRESOLVED_HOST: ${WEAVIATE_MIGRATION_IGNORE_UNRESOLVED_HOST:-true}
+    depends_on:
+      weaviate:
+        condition: service_healthy
 
   # Qdrant vector store.
   # (if used, you need to set VECTOR_STORE to qdrant in the api & worker service.)

@@ -10,69 +10,115 @@ This script:
 - Preserves all object properties and vectors
 """
 
-import weaviate
-from weaviate.classes.config import Configure, VectorDistances
+from __future__ import annotations
+
+import logging
+import os
 import sys
 import time
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Optional
 
-# Configuration
-WEAVIATE_HOST = "localhost"
-WEAVIATE_PORT = 8080
-WEAVIATE_GRPC_PORT = 50051
-WEAVIATE_API_KEY = "WVF5YThaHlkYwhGUSmCRgsX3tD5ngdN8pkih"
-BATCH_SIZE = 100
+import requests
+import weaviate
+
+LOG_LEVEL = os.getenv("WEAVIATE_MIGRATION_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("weaviate-migration")
+
+# Configuration sourced from environment with sensible defaults for local docker usage
+WEAVIATE_SCHEME = os.getenv("WEAVIATE_SCHEME", "http")
+WEAVIATE_HOST = os.getenv("WEAVIATE_HOST", "localhost")
+WEAVIATE_PORT = int(os.getenv("WEAVIATE_PORT", "8080"))
+WEAVIATE_GRPC_PORT = int(os.getenv("WEAVIATE_GRPC_PORT", "50051"))
+WEAVIATE_API_KEY = os.getenv("WEAVIATE_API_KEY")
+BATCH_SIZE = int(os.getenv("WEAVIATE_MIGRATION_BATCH_SIZE", "100"))
+REQUEST_TIMEOUT = float(os.getenv("WEAVIATE_MIGRATION_HTTP_TIMEOUT", "5"))
+REQUEST_RETRIES = int(os.getenv("WEAVIATE_MIGRATION_HTTP_RETRIES", "5"))
+REQUEST_RETRY_DELAY = float(os.getenv("WEAVIATE_MIGRATION_HTTP_RETRY_DELAY", "2"))
+
+
+def _auth_headers() -> Dict[str, str]:
+    if WEAVIATE_API_KEY:
+        return {"Authorization": f"Bearer {WEAVIATE_API_KEY}"}
+    return {}
+
+
+def _base_url() -> str:
+    return f"{WEAVIATE_SCHEME}://{WEAVIATE_HOST}:{WEAVIATE_PORT}"
+
+
+def _request_with_retry(method: str, path: str, **kwargs: Any) -> requests.Response:
+    url = f"{_base_url()}{path}"
+    headers = kwargs.pop("headers", {})
+    merged_headers = {**_auth_headers(), **headers}
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, REQUEST_RETRIES + 1):
+        try:
+            response = requests.request(
+                method,
+                url,
+                headers=merged_headers,
+                timeout=REQUEST_TIMEOUT,
+                **kwargs,
+            )
+            response.raise_for_status()
+            return response
+        except Exception as exc:  # noqa: BLE001 - capture to retry
+            last_exc = exc
+            logger.warning(
+                "HTTP %s %s failed on attempt %s/%s: %s",
+                method,
+                path,
+                attempt,
+                REQUEST_RETRIES,
+                exc,
+            )
+            if attempt < REQUEST_RETRIES:
+                time.sleep(REQUEST_RETRY_DELAY)
+    assert last_exc is not None  # for type checkers
+    raise last_exc
 
 
 def identify_old_collections(client: weaviate.WeaviateClient) -> List[str]:
-    """Identify collections that need migration (those without vectorConfig)"""
-    collections_to_migrate = []
-    
+    """Identify collections that need migration (those without vectorConfig)."""
+    collections_to_migrate: List[str] = []
+
     all_collections = client.collections.list_all()
-    print(f"Found {len(all_collections)} total collections")
-    
+    logger.info("Found %s total collections", len(all_collections))
+
     for collection_name in all_collections.keys():
         # Only check Vector_index collections (Dify knowledge bases)
         if not collection_name.startswith("Vector_index_"):
             continue
-            
+
         collection = client.collections.get(collection_name)
         config = collection.config.get()
-        
+
         # Check if this collection has the old schema
         if config.vector_config is None:
             collections_to_migrate.append(collection_name)
-            print(f"  - {collection_name}: OLD SCHEMA (needs migration)")
+            logger.info("  - %s: OLD SCHEMA (needs migration)", collection_name)
         else:
-            print(f"  - {collection_name}: NEW SCHEMA (skip)")
-    
+            logger.debug("  - %s: NEW SCHEMA (skip)", collection_name)
+
     return collections_to_migrate
 
 
 def get_collection_schema(client: weaviate.WeaviateClient, collection_name: str) -> Dict[str, Any]:
-    """Get the full schema of a collection via REST API"""
-    import requests
-    
-    response = requests.get(
-        f"http://{WEAVIATE_HOST}:{WEAVIATE_PORT}/v1/schema/{collection_name}",
-        headers={"Authorization": f"Bearer {WEAVIATE_API_KEY}"}
-    )
-    
-    if response.status_code == 200:
-        return response.json()
-    else:
-        raise Exception(f"Failed to get schema: {response.text}")
+    """Get the full schema of a collection via REST API."""
+    response = _request_with_retry("GET", f"/v1/schema/{collection_name}")
+    return response.json()
 
 
 def create_new_collection(client: weaviate.WeaviateClient, old_name: str, schema: Dict[str, Any]) -> str:
-    """Create a new collection with updated schema using REST API"""
-    import requests
-    
+    """Create a new collection with updated schema using REST API."""
+
     # Generate new collection name
     new_name = f"{old_name}_migrated"
-    
-    print(f"Creating new collection: {new_name}")
-    
+
+    logger.info("Creating new collection: %s", new_name)
+
     # Build new schema with proper vectorConfig
     # Note: When using vectorConfig (named vectors), we don't set class-level vectorizer
     new_schema = {
@@ -99,18 +145,11 @@ def create_new_collection(client: weaviate.WeaviateClient, old_name: str, schema
     # Copy properties from old schema
     if "properties" in schema:
         new_schema["properties"] = schema["properties"]
-    
+
     # Create collection via REST API
-    response = requests.post(
-        f"http://{WEAVIATE_HOST}:{WEAVIATE_PORT}/v1/schema",
-        json=new_schema,
-        headers={"Authorization": f"Bearer {WEAVIATE_API_KEY}"}
-    )
-    
-    if response.status_code not in [200, 201]:
-        raise Exception(f"Failed to create collection: {response.text}")
-    
-    print(f"  Created new collection: {new_name}")
+    _request_with_retry("POST", "/v1/schema", json=new_schema)
+
+    logger.info("  Created new collection: %s", new_name)
     return new_name
 
 
@@ -127,7 +166,7 @@ def migrate_collection_data(
     total_migrated = 0
     cursor = None
     
-    print(f"Migrating data from {old_collection_name} to {new_collection_name}")
+    logger.info("Migrating data from %s to %s", old_collection_name, new_collection_name)
     
     while True:
         # Fetch batch of objects using cursor-based pagination
@@ -164,7 +203,7 @@ def migrate_collection_data(
                 )
         
         total_migrated += len(objects)
-        print(f"  Migrated {total_migrated} objects...")
+        logger.info("  Migrated %s objects...", total_migrated)
         
         # Update cursor for next iteration
         if len(objects) < BATCH_SIZE:
@@ -174,7 +213,7 @@ def migrate_collection_data(
             # Get the last object's UUID for cursor
             cursor = objects[-1].uuid
     
-    print(f"  Total migrated: {total_migrated} objects")
+    logger.info("  Total migrated: %s objects", total_migrated)
     return total_migrated
 
 
@@ -199,16 +238,16 @@ def verify_migration(
     old_count = old_agg.total_count
     new_count = new_agg.total_count
     
-    print(f"\nVerification:")
-    print(f"  Old collection ({old_collection_name}): {old_count} objects")
-    print(f"  New collection ({new_collection_name}): {new_count} objects")
-    
+    logger.info("Verification:")
+    logger.info("  Old collection (%s): %s objects", old_collection_name, old_count)
+    logger.info("  New collection (%s): %s objects", new_collection_name, new_count)
+
     if old_count == new_count:
-        print(f"  Status: SUCCESS - Counts match!")
+        logger.info("  Status: SUCCESS - Counts match!")
         return True
-    else:
-        print(f"  Status: WARNING - Counts don't match!")
-        return False
+
+    logger.warning("  Status: WARNING - Counts don't match!")
+    return False
 
 
 def replace_old_collection(
@@ -216,50 +255,40 @@ def replace_old_collection(
     old_collection_name: str,
     new_collection_name: str
 ):
-    """Replace old collection with migrated one by recreating with original name"""
-    import requests
-    
-    print(f"\nReplacing old collection with migrated data...")
+    """Replace old collection with migrated one by recreating with original name."""
+
+    logger.info("Replacing old collection %s with migrated data", old_collection_name)
     
     # Step 1: Get data from migrated collection
-    print(f"  Step 1: Getting data from migrated collection...")
+    logger.info("  Step 1: Getting data from migrated collection...")
     migrated = client.collections.get(new_collection_name)
     objects = migrated.query.fetch_objects(include_vector=True, limit=10000)
-    print(f"    Found {len(objects.objects)} objects")
+    logger.info("    Found %s objects", len(objects.objects))
     
     # Step 2: Delete old collection
-    print(f"  Step 2: Deleting old collection...")
-    response = requests.delete(
-        f"http://{WEAVIATE_HOST}:{WEAVIATE_PORT}/v1/schema/{old_collection_name}",
-        headers={"Authorization": f"Bearer {WEAVIATE_API_KEY}"}
-    )
-    if response.status_code != 200:
-        print(f"    Warning: Could not delete old collection: {response.text}")
-    else:
-        print(f"    Deleted")
+    logger.info("  Step 2: Deleting old collection...")
+    try:
+        _request_with_retry("DELETE", f"/v1/schema/{old_collection_name}")
+        logger.info("    Deleted")
+    except Exception as exc:  # noqa: BLE001 - log and continue
+        logger.warning("    Warning: Could not delete old collection: %s", exc)
     
     # Step 3: Get schema from migrated collection
-    print(f"  Step 3: Getting schema from migrated collection...")
-    schema_response = requests.get(
-        f"http://{WEAVIATE_HOST}:{WEAVIATE_PORT}/v1/schema/{new_collection_name}",
-        headers={"Authorization": f"Bearer {WEAVIATE_API_KEY}"}
+    logger.info("  Step 3: Getting schema from migrated collection...")
+    schema_response = _request_with_retry(
+        "GET",
+        f"/v1/schema/{new_collection_name}",
     )
     schema = schema_response.json()
     schema["class"] = old_collection_name
     
     # Step 4: Create collection with original name and new schema
-    print(f"  Step 4: Creating collection with original name...")
-    create_response = requests.post(
-        f"http://{WEAVIATE_HOST}:{WEAVIATE_PORT}/v1/schema",
-        json=schema,
-        headers={"Authorization": f"Bearer {WEAVIATE_API_KEY}"}
-    )
-    if create_response.status_code not in [200, 201]:
-        raise Exception(f"Failed to create collection: {create_response.text}")
-    print(f"    Created")
+    logger.info("  Step 4: Creating collection with original name...")
+    _request_with_retry("POST", "/v1/schema", json=schema)
+    logger.info("    Created")
     
     # Step 5: Copy data to collection with original name
-    print(f"  Step 5: Copying data to original collection name...")
+    logger.info("  Step 5: Copying data to original collection name...")
     new_collection = client.collections.get(old_collection_name)
     
     with new_collection.batch.dynamic() as batch:
@@ -271,107 +300,115 @@ def replace_old_collection(
             )
     
     count = new_collection.aggregate.over_all(total_count=True).total_count
-    print(f"    Copied {count} objects")
+    logger.info("    Copied %s objects", count)
     
     # Step 6: Delete the temporary migrated collection
-    print(f"  Step 6: Cleaning up temporary migrated collection...")
-    response = requests.delete(
-        f"http://{WEAVIATE_HOST}:{WEAVIATE_PORT}/v1/schema/{new_collection_name}",
-        headers={"Authorization": f"Bearer {WEAVIATE_API_KEY}"}
-    )
-    if response.status_code == 200:
-        print(f"    Cleaned up")
-    
-    print(f"\n  SUCCESS! {old_collection_name} now has the new schema with {count} objects")
+    logger.info("  Step 6: Cleaning up temporary migrated collection...")
+    try:
+        _request_with_retry("DELETE", f"/v1/schema/{new_collection_name}")
+        logger.info("    Cleaned up")
+    except Exception as exc:  # noqa: BLE001 - log and continue
+        logger.warning("    Warning: Could not clean up temporary collection: %s", exc)
+
+    logger.info("  SUCCESS! %s now has the new schema with %s objects", old_collection_name, count)
     return True
 
 
-def migrate_all_collections():
-    """Main migration function"""
-    
-    print("=" * 80)
-    print("Weaviate Collection Migration Script")
-    print("Migrating from Weaviate 1.19.0 schema to 1.27.0+ schema")
-    print("=" * 80)
-    print()
-    
+def migrate_all_collections() -> List[str]:
+    """Main migration function."""
+
+    logger.info("=" * 80)
+    logger.info("Weaviate Collection Migration Script")
+    logger.info("Migrating from Weaviate 1.19.0 schema to 1.27.0+ schema")
+    logger.info("=" * 80)
+
+    auth_credentials: Optional[weaviate.auth.AuthCredentials] = None
+    if WEAVIATE_API_KEY:
+        auth_credentials = weaviate.auth.AuthApiKey(WEAVIATE_API_KEY)
+
     client = weaviate.connect_to_local(
         host=WEAVIATE_HOST,
         port=WEAVIATE_PORT,
         grpc_port=WEAVIATE_GRPC_PORT,
-        auth_credentials=weaviate.auth.AuthApiKey(WEAVIATE_API_KEY)
+        auth_credentials=auth_credentials,
     )
-    
+
+    migrated_collections: List[str] = []
+
     try:
         # Step 1: Identify collections that need migration
-        print("Step 1: Identifying collections that need migration...")
+        logger.info("Step 1: Identifying collections that need migration...")
         collections_to_migrate = identify_old_collections(client)
-        
+
         if not collections_to_migrate:
-            print("\nNo collections need migration. All collections are up to date!")
-            return
-        
-        print(f"\nFound {len(collections_to_migrate)} collections to migrate:")
+            logger.info("No collections need migration. All collections are up to date!")
+            return migrated_collections
+
+        logger.info("Found %s collections to migrate:", len(collections_to_migrate))
         for col in collections_to_migrate:
-            print(f"  - {col}")
-        
+            logger.info("  - %s", col)
+
         # Confirm before proceeding
-        print("\nThis script will:")
-        print("1. Create new collections with updated schema")
-        print("2. Copy all data using efficient batch operations")
-        print("3. Verify the migration")
-        print("4. Optionally rename collections to activate the new ones")
-        print()
-        
+        logger.info(
+            "This script will:\n"
+            "1. Create new collections with updated schema\n"
+            "2. Copy all data using efficient batch operations\n"
+            "3. Verify the migration\n"
+            "4. Replace old collections with migrated ones"
+        )
+
         # Step 2: Migrate each collection
         for collection_name in collections_to_migrate:
-            print("\n" + "=" * 80)
-            print(f"Migrating: {collection_name}")
-            print("=" * 80)
-            
+            logger.info("=" * 80)
+            logger.info("Migrating: %s", collection_name)
+            logger.info("=" * 80)
+
             try:
                 # Get old schema
                 schema = get_collection_schema(client, collection_name)
-                
+
                 # Create new collection
                 new_collection_name = create_new_collection(client, collection_name, schema)
-                
+
                 # Migrate data
                 migrated_count = migrate_collection_data(client, collection_name, new_collection_name)
-                
+
                 # Verify migration
                 success = verify_migration(client, collection_name, new_collection_name)
-                
+
                 if success and migrated_count > 0:
-                    print(f"\nMigration successful for {collection_name}!")
-                    print(f"New collection: {new_collection_name}")
-                    
+                    logger.info("Migration successful for %s", collection_name)
+                    logger.info("New collection: %s", new_collection_name)
+
                     # Automatically replace old collection with migrated one
                     try:
                         replace_old_collection(client, collection_name, new_collection_name)
+                        migrated_collections.append(collection_name)
                     except Exception as e:
-                        print(f"\nWarning: Could not automatically replace collection: {e}")
-                        print(f"\nTo activate manually:")
-                        print(f"1. Delete the old collection: {collection_name}")
-                        print(f"2. Rename {new_collection_name} to {collection_name}")
-                
+                        logger.warning("Warning: Could not automatically replace collection: %s", e)
+                        logger.warning("To activate manually:")
+                        logger.warning("1. Delete the old collection: %s", collection_name)
+                        logger.warning("2. Rename %s to %s", new_collection_name, collection_name)
+
             except Exception as e:
-                print(f"\nError migrating {collection_name}: {e}")
-                print(f"Skipping this collection and continuing...")
+                logger.exception("Error migrating %s: %s", collection_name, e)
+                logger.warning("Skipping this collection and continuing...")
                 continue
-        
-        print("\n" + "=" * 80)
-        print("Migration Complete!")
-        print("=" * 80)
-        print("\nSummary:")
-        print(f"  Collections migrated: {len(collections_to_migrate)}")
-        print(f"\nNext steps:")
-        print(f"1. Test the new collections (*_migrated)")
-        print(f"2. If everything works, delete or backup the old collections")
-        print(f"3. Rename the new collections to remove '_migrated' suffix")
-        
+
+        logger.info("=" * 80)
+        logger.info("Migration Complete!")
+        logger.info("=" * 80)
+        logger.info("Summary:")
+        logger.info("  Collections migrated: %s", len(migrated_collections))
+        logger.info("Next steps:")
+        logger.info("1. Test the new collections (*_migrated)")
+        logger.info("2. If everything works, delete or backup the old collections")
+        logger.info("3. Rename the new collections to remove '_migrated' suffix")
+
     finally:
         client.close()
+
+    return migrated_collections
 
 
 if __name__ == "__main__":
